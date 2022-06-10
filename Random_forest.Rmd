@@ -1,0 +1,171 @@
+---
+title: "Hops Project_MB599"
+author: "Agung Irawan"
+date: "4/25/2022"
+output: html_document
+---
+
+## Including Plots
+```{r}
+library(ggplot2)
+library(vegan)
+library(permute)
+library(dplyr)
+library(magrittr)
+library(scales)
+library(grid)
+library(reshape2)
+library(phyloseq)
+library(randomForest)
+library(knitr)
+library(caret)
+library(glmnet)
+```
+
+#Load data
+```{r}
+psdata <- readRDS("~/irawana_mb599/phyloseq/mb599data.Rds")
+View(as.matrix.data.frame(sample_data(psdata)))
+
+```
+
+# Factorize and set the levels on the metadata
+```{r}
+week_levels <- c("1", "2", "3", "4", "5")
+sample_data(psdata)$Week = factor(week_levels)
+
+ids <- sample_data(psdata)$Participant.ID
+participant_levels <- c("101", "102", "103", "104", "105", "106", "107", 
+                        "109", "110", "111", "112", "113", "114", "115", 
+                        "116", "117", "118", "119", "120", "121", "122", 
+                        "123", "124" ,"125", "126", "127", "128", "129", 
+                        "130", "131")
+sample_data(psdata)$Participant.ID <-  factor(ids, levels = participant_levels)
+
+group_levels <- c("treatment", "control")
+group <- get_variable(psdata, "Group")
+sample_data(psdata)$Group = factor(group, levels = group_levels)
+
+# Agglomerate to the genus level
+ps_genera <- psdata %>% tax_glom(taxrank = "Genus")
+# Remove taxa not seen more than 3 times in at least 20% of the samples
+ps_counts <- ps_genera %>% filter_taxa(function(x) sum(x > 3) > (0.2*length(x)), TRUE)
+# Convert from counts to relative abundance
+ps_relab <- ps_counts %>% transform_sample_counts(function(x) x / sum(x))
+# Filter out low abundance (>1e-5) taxa
+ps <- ps_relab %>% filter_taxa(function(x) mean(x) > 1e-5, TRUE)
+
+# Add Metabotypes for DXN and 8PN
+sample_data(psdata)$metabo_dxn <- ifelse(sample_data(psdata)$DXN > 2292, "high", "low")
+sample_data(psdata)$metabo_8pn <- ifelse(sample_data(psdata)$X8PN > 1910, "high", "low")
+# Facotize DXN and 8PN metabotypes
+metabotypes <- c("high", "low")
+sample_data(psdata)$metabo_dxn <- factor(sample_data(psdata)$metabo_dxn, levels = metabotypes)
+sample_data(psdata)$metabo_8pn <- factor(sample_data(psdata)$metabo_8pn, levels = metabotypes)
+```
+
+#PCoA
+```{r, fig.height = 3}
+ord <- ordinate(ps, method = "PCoA", distance = 'euclidean')
+plot_ordination(ps, ord, 'samples', color = 'Group')
+```
+
+```{r}
+par(mfrow=c(1,2))
+ps@sam_data$Group_treatment = ps@sam_data$Group == "treatment"
+ps@sam_data$Group_control = ps@sam_data$Group == "control"
+plot_ordination(ps, ord, 'samples', color = 'Group_treatment')
+plot_ordination(ps, ord, 'samples', color = 'Group_control')
+```
+
+#Random forest
+```{r}
+set.seed(1)
+index_train <- createDataPartition(psdata@sam_data$Group, p = 0.5)[[1]]
+train <- psdata@otu_table[index_train, ]
+test <- psdata@otu_table[-index_train, ]
+
+#spliting the phyloseq objects
+pstrain <- phyloseq(otu_table(train, taxa_are_rows = FALSE), psdata@sam_data[index_train, ])
+pstest <- phyloseq(otu_table(test, taxa_are_rows = FALSE), psdata@sam_data[-index_train, ])
+
+#Train model
+model_ridge <- glmnet(x = as.matrix(train), y = pstrain@sam_data$Group, family = 'binomial', alpha = 0)
+model_ridge
+```
+
+
+#Find optimum mtry
+```{r}
+set.seed(1)
+datatrain = data.frame(train)
+datatrain$sample_group = pstrain@sam_data$Group
+control <- trainControl(method='repeatedcv', 
+                        number=3, 
+                        repeats=3,
+                        allowParallel = F)
+
+tunegrid <- expand.grid(.mtry=c(1:20)) 
+rf <- train(sample_group ~., 
+            data= datatrain, 
+            method='rf', 
+            metric='Accuracy', 
+            tuneGrid=tunegrid, 
+            trControl=control)
+print(rf)
+```
+
+
+#Testing model performance
+```{r}
+mtry_best = as.numeric(rf$bestTune)
+model = randomForest(train, y = as.factor(pstrain@sam_data$Group), mtry = mtry_best)
+
+#Performance on test set
+preds = predict(model, test)
+print(paste("Accuracy: ", sum(preds == as.factor(pstest@sam_data$Group)) / nsamples(pstest)))
+
+#Visualize on test dataset
+ord <- ordinate(pstest, method = "PCoA", distance = 'euclidean')
+pstest@sam_data$rf_predictions = predict(model, pstest@otu_table)
+plot_ordination(pstest, ord, 'samples', color = 'Group', shape = 'rf_predictions') + geom_point(size = 4) +
+  ggtitle("Microbiome classification between groups based on random forest algorithm")
+```
+
+#obtain the important taxa based on treatment vs control group
+```{r}
+model = randomForest(pstest@otu_table, y = as.factor(pstest@sam_data$Group), mtry = mtry_best)
+varImpPlot(model, type = 2)
+```
+
+
+#obtain the important taxa based on DXN metabolite concentration "High vs Low"
+```{r}
+model = randomForest(pstest@otu_table, y = as.factor(pstest@sam_data$metabo_dxn), mtry = mtry_best)
+varImpPlot(model, type = 2)
+```
+
+
+##obtain the important taxa based on 8PN metabolite concentration "High vs Low"
+
+```{r}
+model = randomForest(pstest@otu_table, y = as.factor(pstest@sam_data$metabo_8pn), mtry = mtry_best)
+varImpPlot(model, type = 2)
+```
+
+
+#Important variables
+```{r}
+imp_list <- list()
+for(i in 1:20){
+  model = randomForest(pstest@otu_table, y = as.factor(pstest@sam_data$Group), mtry = mtry_best)
+  imp_list[i] <- varImp(model)
+}
+
+imp_df <- do.call(rbind.data.frame, imp_list)
+colnames(imp_df) <- colnames(pstest)
+colMeans(imp_df)
+barplot(sort(colMeans(imp_df)), horiz = T, las = 1, xlab = "Mean variable importance")
+```
+
+
